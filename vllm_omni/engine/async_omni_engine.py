@@ -1169,41 +1169,37 @@ class AsyncOmniEngine:
                 else:
                     llm_replicas.append((plan.stage_idx, replica))
 
-        # Lazily create the engine-level executor (once per engine lifetime).
-        if llm_replicas and getattr(self, "_stage_init_executor", None) is None:
-            self._stage_init_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, len(llm_replicas)),
-                thread_name_prefix="stage-init",
-            )
+        # --- 1) Diffusion replicas: inline on the orchestrator thread. ---
+        for stage_idx, replica in diffusion_replicas:
+            try:
+                initialized_clients_by_stage[stage_idx][replica.replica_id] = self._initialize_replica(
+                    replica,
+                    stage_init_timeout,
+                    stage_launch_lock,
+                )
+            except Exception as exc:
+                primary_exc = exc
+                break
 
-        # --- 1) Submit LLM replicas to the long-lived executor (starts
-        #     loading in background). ---
-        future_to_replica: dict[concurrent.futures.Future[StagePoolClient], tuple[int, int]] = {}
-        for stage_idx, replica in llm_replicas:
-            future = self._stage_init_executor.submit(
-                self._initialize_replica,
-                replica,
-                stage_init_timeout,
-                stage_launch_lock,
-            )
-            future_to_replica[future] = (stage_idx, replica.replica_id)
+        # --- 2) LLM replicas: parallel init via a long-lived ThreadPoolExecutor. ---
+        if primary_exc is None and llm_replicas:
+            future_to_replica: dict[concurrent.futures.Future[StagePoolClient], tuple[int, int]] = {}
+            if getattr(self, "_stage_init_executor", None) is None:
+                self._stage_init_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max(1, len(llm_replicas)),
+                    thread_name_prefix="stage-init",
+                )
+            init_executor = self._stage_init_executor
+            for stage_idx, replica in llm_replicas:
+                future = init_executor.submit(
+                    self._initialize_replica,
+                    replica,
+                    stage_init_timeout,
+                    stage_launch_lock,
+                )
+                future_to_replica[future] = (stage_idx, replica.replica_id)
 
-        # --- 2) Diffusion replicas: inline on the orchestrator thread.
-        #     LLM is already loading in background — both run concurrently. ---
-        if primary_exc is None:
-            for stage_idx, replica in diffusion_replicas:
-                try:
-                    initialized_clients_by_stage[stage_idx][replica.replica_id] = self._initialize_replica(
-                        replica,
-                        stage_init_timeout,
-                        stage_launch_lock,
-                    )
-                except Exception as exc:
-                    primary_exc = exc
-                    break
 
-        # --- 3) Await LLM futures. ---
-        if primary_exc is None and future_to_replica:
             for future in concurrent.futures.as_completed(future_to_replica):
                 stage_idx, replica_id = future_to_replica[future]
                 try:
