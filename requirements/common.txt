@@ -9,7 +9,7 @@
 # That breakage is now handled in code instead of by pinning:
 # MossTTSNanoForGeneration wraps weight loading in
 # transformers_keys_to_ignore_compat (vllm_omni/model_executor/models/utils.py).
-transformers >= 4.56.0, != 5.0.*, != 5.1.*, != 5.2.*, != 5.3.*, != 5.4.*, != 5.5.0
+transformers >= 5.5.3
 av>=14.0.0
 omegaconf>=2.3.0
 diffusers==0.38.0
