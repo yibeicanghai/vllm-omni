@@ -764,19 +764,6 @@ async def omni_init_app_state(
 
     state.vllm_config = vllm_config
 
-    # Propagate enable_in_reasoning to the API-server process. The engine core
-    # runs in a separate process, so the contextvar that backs
-    # `get_current_vllm_config_or_none()` is None on this stack. Tool parsers
-    # call `get_enable_structured_outputs_in_reasoning()` during request
-    # handling and need to see the real flag, otherwise they silently fall
-    # back to False and mismatch the engine-side bitmask gating.
-    if vllm_config is not None:
-        from vllm.tool_parsers.structural_tag_registry import (
-            set_enable_structured_outputs_in_reasoning,
-        )
-
-        set_enable_structured_outputs_in_reasoning(vllm_config.structured_outputs_config.enable_in_reasoning)
-
     # Get supported tasks
     supported_tasks: set[str] = {"generate"}
     if hasattr(engine_client, "get_supported_tasks"):

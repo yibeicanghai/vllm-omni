@@ -577,7 +577,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             {
                 "stage_id": 0,
                 "max_num_seqs": 1,
-                "gpu_memory_utilization": 0.9,
+                "gpu_memory_utilization": 0.85,
                 "enforce_eager": True,
                 "enable_prefix_caching": False,
                 "max_num_batched_tokens": 16384,

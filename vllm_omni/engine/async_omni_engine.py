@@ -1199,7 +1199,6 @@ class AsyncOmniEngine:
                 )
                 future_to_replica[future] = (stage_idx, replica.replica_id)
 
-
             for future in concurrent.futures.as_completed(future_to_replica):
                 stage_idx, replica_id = future_to_replica[future]
                 try:

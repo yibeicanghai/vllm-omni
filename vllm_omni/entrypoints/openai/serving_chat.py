@@ -3,7 +3,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -66,7 +66,6 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.engine.serving import ChatLikeRequest, clamp_prompt_logprobs
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
-    parse_chat_output,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.serve.utils.api_utils import should_include_usage
@@ -121,6 +120,42 @@ from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 logger = init_logger(__name__)
 
 
+# parse_chat_output was removed from upstream during the harmony refactor
+# (commit f712fd0d7).  Inlined from the last upstream version before removal.
+
+
+def _parse_chat_output(
+    token_ids: Sequence[int],
+) -> tuple[str | None, str | None, bool]:
+    """Parse Harmony output token IDs into reasoning, content, and tool-call flag.
+
+    Replicates the pre-refactor ``parse_chat_output`` from
+    ``vllm.entrypoints.openai.parser.harmony_utils``.
+    """
+    parser = get_streamable_parser_for_assistant()
+    for token_id in token_ids:
+        parser.process(token_id)
+    output_msgs = parser.messages
+
+    reasoning_texts = [msg.content[0].text for msg in output_msgs if msg.channel == "analysis"]
+    final_texts = [
+        msg.content[0].text
+        for msg in output_msgs
+        if msg.channel == "final" or (msg.channel == "commentary" and not msg.recipient)
+    ]
+
+    if parser.current_channel == "analysis" and parser.current_content:
+        reasoning_texts.append(parser.current_content)
+    elif parser.current_channel == "final" and parser.current_content:
+        final_texts.append(parser.current_content)
+    elif parser.current_channel == "commentary" and not parser.current_recipient and parser.current_content:
+        final_texts.append(parser.current_content)
+
+    reasoning: str | None = "\n".join(reasoning_texts) or None
+    final_content: str | None = "\n".join(final_texts) or None
+    return reasoning, final_content, False
+
+
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     """OpenAI-compatible chat serving for both LLM and Diffusion models.
 
@@ -138,6 +173,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _supported_speakers: set[str] | None = None
     _diffusion_extra_body_params: frozenset[str] | None = None
     _diffusion_extra_output_params: frozenset[str] | None = None
+
+    # Harmony flag (always False for vllm-omni models)
+    use_harmony: bool = False
+
+    def _should_stream_with_auto_tool_parsing(self, request: ChatCompletionRequest) -> bool:
+        """Check if streamed tokens should go through the tool-call parser.
+
+        We only want to do this IF user-provided tools are set, a tool parser
+        is configured, "auto" tool choice is enabled, and the request's tool
+        choice field indicates that "auto" tool choice should be used.
+
+        This method existed in upstream vLLM commit 91df0fad4 (OpenAIServingChat)
+        but was removed in the Harmony refactoring (PR #45171, #45104).  Omni's
+        independently-maintained ``chat_completion_stream_generator`` still calls
+        it, so we keep a local copy.
+        """
+        return request.tools and self.tool_parser and self.enable_auto_tools and request.tool_choice in ["auto", None]
 
     @classmethod
     def for_diffusion(
@@ -2012,7 +2064,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logprobs = None
 
             if self.use_harmony:
-                reasoning, content, _ = parse_chat_output(token_ids)
+                reasoning, content, _ = _parse_chat_output(token_ids)
                 if not request.include_reasoning:
                     reasoning = None
 
