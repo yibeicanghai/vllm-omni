@@ -79,6 +79,7 @@ def test_create_chat_completion_converts_value_error_to_error_response(mocker: M
     serving_chat.renderer.get_tokenizer.return_value = mocker.MagicMock()
     serving_chat.reasoning_parser_cls = None
     serving_chat.tool_parser = None
+    serving_chat.parser_cls = None
     serving_chat.use_harmony = False
     serving_chat.enable_auto_tools = False
     serving_chat.exclude_tools_when_tool_choice_none = False
