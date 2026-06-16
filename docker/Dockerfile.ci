@@ -20,7 +20,7 @@ RUN apt-get update && \
 # (e.g. +gaeee7ef93.cu130) which pip/uv refuse to install from a PEP 503 package index.
 # The cu130 wheel index lives at /<commit>/cu130/vllm/ but the actual wheel files
 # are stored at the top level /<commit>/<wheel>.
-ENV VLLM_PRECOMPILED_WHEEL_COMMIT=9872921c5f5e733a4f46943562c0a31c9ff69493
+ENV VLLM_PRECOMPILED_WHEEL_COMMIT=c69c73418ab0ad13e28022ed16573019653a9bf7
 # Ensure CUDA library path is in LD_LIBRARY_PATH so bitsandbytes' precompiled
 # C extension can find libnvJitLink.so.13 (CUDA 13.x JIT linker) at import time.
 # The base vLLM image has bitsandbytes pre-installed; without this env var,
