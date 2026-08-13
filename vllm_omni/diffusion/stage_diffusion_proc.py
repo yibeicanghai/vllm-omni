@@ -48,6 +48,11 @@ logger = init_logger(__name__)
 
 _SIGNAL_EXIT_BASE = 128
 
+# DTPS Module 2: per-queue cap on the request-id sets returned by ``get_load``.
+# Bounds the ZMQ frame when a scheduler queue grows large; a cap biases the AR
+# de-dup toward keeping DiT fed (safe), and ``max_num_seqs`` is tiny in practice.
+_DIT_LOAD_ID_CAP = 256
+
 
 def _signal_exit_code(signum: int) -> int:
     """Return the conventional process exit code for signal-driven exits."""
@@ -598,6 +603,54 @@ class StageDiffusionProc:
                             self._signal_fatal_engine_failure(
                                 f"collective_rpc {msg['method']} (rpc_id={rpc_id}): {e!s}"
                             )
+
+                elif msg_type == "get_load":
+                    # DTPS Module 2: report this replica's DiT scheduler queue
+                    # depth + request-id sets to the orchestrator. Read inline
+                    # from ``run_loop`` (which owns ``self._engine.scheduler``);
+                    # ``len(deque)`` / ``len(list)`` and a snapshot of the id
+                    # containers are GIL-atomic vs. the busy-loop thread's
+                    # ``schedule()`` — no lock needed for a load heuristic. The
+                    # ids let the AR scheduler de-duplicate its blind in-flight
+                    # set (requests that finished AR but haven't surfaced in a
+                    # poll yet). Capped at ``_DIT_LOAD_ID_CAP`` per queue to
+                    # bound the ZMQ frame; a cap biases the AR side toward
+                    # keeping DiT fed (safe). Never routed through the executor:
+                    # the executor doesn't know about the scheduler queue, and
+                    # an inline reply keeps this sub-millisecond so the client's
+                    # short timeout never fires on a healthy replica.
+                    try:
+                        sched = getattr(self._engine, "scheduler", None) if self._engine else None
+                        if sched is None:
+                            waiting, running = 0, 0
+                            waiting_ids: list[str] = []
+                            running_ids: list[str] = []
+                        else:
+                            waiting = len(getattr(sched, "_waiting", ()) or ())
+                            running = len(getattr(sched, "_running", ()) or ())
+                            waiting_ids = list(getattr(sched, "_waiting", ()) or [])[
+                                :_DIT_LOAD_ID_CAP
+                            ]
+                            running_ids = list(getattr(sched, "_running", ()) or [])[
+                                :_DIT_LOAD_ID_CAP
+                            ]
+                    except Exception:
+                        logger.debug(
+                            "get_load: failed to read scheduler state", exc_info=True
+                        )
+                        waiting, running = 0, 0
+                        waiting_ids, running_ids = [], []
+                    await response_socket.send(
+                        encoder.encode(
+                            {
+                                "type": "load_result",
+                                "waiting": int(waiting),
+                                "running": int(running),
+                                "waiting_ids": waiting_ids,
+                                "running_ids": running_ids,
+                            }
+                        )
+                    )
 
                 elif msg_type == "shutdown":
                     break

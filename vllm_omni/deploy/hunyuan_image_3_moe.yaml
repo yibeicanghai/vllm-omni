@@ -5,6 +5,44 @@ pipeline: hunyuan_image_3_moe
 async_chunk: false
 trust_remote_code: true
 
+# DTPS (DiT-priority Type-based Scheduling) — opt-in AR-stage reorder that
+# keeps the downstream DiT stage fed under mixed i2t / t2i / it2i traffic.
+# Consumed ONLY by AR+DiT deployments (stage 0 == LLM_AR with a downstream
+# DIFFUSION stage, which this pipeline is); ignored by every other form, so
+# non-AR+DiT models are unaffected. At merge time the block is validated,
+# normalized, and injected into the AR stage as the INDEPENDENT engine arg
+# ``omni_dtps_config`` (kept out of ``omni_kv_config``, which is the
+# KV-transfer/connector config and unrelated to AR-queue scheduling), which
+# the AR scheduler consumes to build a DTPSScheduler. Set ``enabled: false``
+# (or drop the block) to fall back to pure FCFS for A/B comparison.
+dtps:
+  enabled: true
+  # Seconds an ar_only (e.g. i2t) request waits in the AR queue before being
+  # promoted to L0 (starvation guard). Raise to favor DiT-feed throughput,
+  # lower to favor i2t latency.
+  i2t_aging_s: 500.0
+  # Request field (in additional_information) carrying the CoT-length tag used
+  # to order ar_downstream requests. HunyuanImage-3.0 uses ``bot_task``; other
+  # AR+DiT models override this per-deploy.
+  cot_tag_key: bot_task
+  # Model-specific CoT-length weights keyed by the cot_tag value. Only the
+  # relative order matters: ar_downstream requests are ordered within L1 by
+  # ar_proxy = num_prompt_tokens + weight (ascending = admitted first), so a
+  # larger weight means longer expected AR dwell and later admission. The
+  # table is consulted only for ar_downstream (t2i/it2i) requests; ar_only
+  # (i2t) requests are ordered by arrival time. Omit the table (or leave it
+  # empty) to degrade to pure num_prompt_tokens ordering.
+  cot_weight_table:
+    img_ratio: 0           # ratio-only, no CoT
+    image: 0               # plain understanding (ar_only; weight unused for L1)
+    auto: 0                # auto route, treat as no-CoT
+    vanilla: 0             # plain generation, no special CoT
+    recaption: 800         # short recaption CoT
+    think: 1500            # full thinking CoT
+    think_recaption: 2000  # thinking + recaption (longest AR dwell)
+
+  dit_load_threshold: 2
+
 connectors:
   rdma_connector:
     name: MooncakeTransferEngineConnector
@@ -41,7 +79,7 @@ stages:
     is_comprehension: true
     final_output: true
     final_output_type: text
-    max_num_seqs: 1
+    max_num_seqs: 3
     gpu_memory_utilization: 0.95
     enforce_eager: true
     max_num_batched_tokens: 32768

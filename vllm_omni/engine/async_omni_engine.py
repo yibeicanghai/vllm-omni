@@ -31,6 +31,8 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.stage_config import strip_parent_engine_args
+from vllm_omni.core.sched.dit_load_shared import DitLoadSharedState
+from vllm_omni.core.sched.dit_load_state import DitLoadState
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -414,6 +416,23 @@ class AsyncOmniEngine:
 
             membership_controller = self._runtime.create_membership_controller()
 
+            # [OmniDTPS Module 2] DiT-stage load awareness wiring.
+            # DitLoadState (cross-thread, main process): the Orchestrator polls
+            # each DiT replica's queue depth and updates per replica; an entry is
+            # evicted on detected exit (health check or distributed unregister),
+            # so no stale-timeout filter is needed.
+            # DitLoadSharedState (cross-process shared memory): after each poll
+            # tick the Orchestrator writes the aggregate snapshot into the
+            # shared buffer. The AR subprocess reattaches by NAME — only the
+            # name (a string) crossed the pickle boundary, injected by
+            # StageRuntime before the AR subprocess was spawned. (Directly
+            # injecting DitLoadState would pickle an independent copy and
+            # silently break Module 2 in real AR+DiT deployments.)
+            dit_load_state = DitLoadState()
+            dit_load_shared_state = getattr(
+                self._runtime, "_dit_load_shared_state", None
+            )
+
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
                 output_async_queue=self.output_queue.async_q,
@@ -425,10 +444,25 @@ class AsyncOmniEngine:
                 running_counter=self._running_counter,
                 transfer_emitter=self._transfer_emitter,
                 log_stats=self._log_stats,
+                dit_load_state=dit_load_state,
+                dit_load_shared_state=dit_load_shared_state,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
-            await orchestrator.run()
+            try:
+                await orchestrator.run()
+            finally:
+                # Shared-memory cleanup: close + unlink in the main process;
+                # AR subprocess readers only close() (they must NOT unlink).
+                if dit_load_shared_state is not None:
+                    try:
+                        dit_load_shared_state.close()
+                    except Exception:
+                        pass
+                    try:
+                        dit_load_shared_state.unlink()
+                    except Exception:
+                        pass
 
         try:
             loop.run_until_complete(_run_orchestrator())

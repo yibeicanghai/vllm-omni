@@ -164,6 +164,7 @@ class OmniEngineArgs(EngineArgs):
     # drop the value when constructing OmniEngineArgs from kwargs.
     active_stream_window: int = 0
     omni_kv_config: dict | None = None
+    omni_dtps_config: dict[str, Any] | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
@@ -349,6 +350,7 @@ class OmniEngineArgs(EngineArgs):
             stage_connector_config=stage_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
             omni_kv_config=self.omni_kv_config,
+            omni_dtps_config=self.omni_dtps_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
         )

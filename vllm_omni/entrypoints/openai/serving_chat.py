@@ -457,6 +457,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     tprompt["modalities"] = ["image"]
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
+
+                _bot_task = extra_body.get("bot_task")
+                if _bot_task is not None:
+                    self._ensure_prompt_additional_information(tprompt)[
+                        "bot_task"
+                    ] = _bot_task
                 # Always attach mm_processor_kwargs (possibly empty) so
                 # OmniInputPreprocessor._process_text routes through the
                 # multimodal processor path. Without it, the preprocessor
@@ -530,6 +536,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
             for i, engine_prompt in enumerate(engine_prompts):
+                # [OmniDTPS] Stamp the request's declared task type (i2t / t2i /
+                # it2i) into the engine prompt's additional_information so the
+                # AR-stage DTPS scheduler classifies by request intent rather
+                # than by inferred terminal stage. This is the AR+DiT
+                # multi-stage chat path; i2t (text output, finishing at AR) is
+                # stamped here too — the case the pure-diffusion path never sees.
+                # ``None`` (non-image chat) skips stamping; DTPS then falls back
+                # to omni_final_stage_id, so non-image traffic is unaffected.
+                _omni_task_type = self._resolve_omni_task_type_for_chat(request)
+                if _omni_task_type is not None and isinstance(engine_prompt, dict):
+                    self._ensure_prompt_additional_information(engine_prompt)[
+                        "omni_task_type"
+                    ] = _omni_task_type
+
                 if hasattr(request, "sampling_params_list"):
                     sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:
@@ -734,6 +754,41 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             additional_information = {}
             engine_prompt["additional_information"] = additional_information
         return additional_information
+
+    def _resolve_omni_task_type_for_chat(self, request: Any) -> str | None:
+        """Resolve the request's declared task type (i2t / t2i / it2i) for the
+        AR+DiT multi-stage chat path, where the three are unambiguously
+        distinguishable at the API entry from ``request.modalities`` plus the
+        presence of a reference image. Mirrors the discrimination used by the
+        pure-diffusion path so the two paths agree on task-type semantics:
+
+        * ``"text"`` in modalities  → ``i2t``  (image understanding, text
+          output; finishes at the AR stage → DTPS ar_only bucket)
+        * ``"image"`` in modalities + reference image → ``it2i`` (image
+          editing; AR feeds DiT → ar_downstream bucket)
+        * ``"image"`` in modalities, no reference image → ``t2i`` (text-to-
+          image; AR feeds DiT → ar_downstream bucket)
+
+        Returns ``None`` when modalities carry neither ``"text"`` nor
+        ``"image"`` (e.g. audio/video chat); the caller then skips stamping and
+        the AR-side DTPS scheduler falls back to ``omni_final_stage_id`` +
+        ``bot_task`` classification, so non-image chat traffic is unaffected.
+        """
+        modalities = getattr(request, "modalities", None) or []
+        if "image" in modalities:
+            # Image-output task: t2i (gen) vs it2i (edit). it2i iff the user
+            # supplied a reference image in the messages — the same signal the
+            # image branch of _create_chat_completion uses to set img2img.
+            try:
+                _prompt, ref_images = self._extract_diffusion_prompt_and_images_from_messages(
+                    request.messages
+                )
+            except Exception:
+                ref_images = []
+            return "it2i" if ref_images else "t2i"
+        if "text" in modalities:
+            return "i2t"
+        return None
 
     def _needs_multistage_multimodal_split(self) -> bool:
         return bool(self._deferred_multimodal_modalities())
@@ -2765,6 +2820,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         engine_prompt["modalities"] = modalities
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
+
+        _dtps_info = self._ensure_prompt_additional_information(engine_prompt)
+        _dtps_info["omni_task_type"] = "it2i" if reference_images else "t2i"
+        if bot_task is not None:
+            _dtps_info["bot_task"] = bot_task
 
         mm_processor_kwargs: dict[str, Any] = {}
         if height is not None:

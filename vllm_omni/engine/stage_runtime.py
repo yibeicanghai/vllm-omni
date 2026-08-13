@@ -28,6 +28,10 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
+from vllm_omni.core.sched.dit_load_shared import (
+    DitLoadSharedState,
+    _DIT_LOAD_SHM_NAME_KEY,
+)
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     RegisterRemoteReplicaMessage,
@@ -141,6 +145,15 @@ class StageRuntime:
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._spawn_device_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
+
+        # [OmniDTPS Module 2] Cross-process shared-memory writer handle for
+        # DiT-load aggregation. Created ONCE before the first AR replica with
+        # Module 2 enabled is spawned (see _initialize_local_llm_replica), so
+        # the segment NAME can be injected into the shared ``omni_dtps_config``
+        # dict and cross the pickle boundary as a string. The Orchestrator
+        # writes aggregate snapshots into it every DiT-poll tick. ``None`` when
+        # Module 2 is disabled.
+        self._dit_load_shared_state: DitLoadSharedState | None = None
 
     @staticmethod
     def _client_addresses_from_zmq(addresses: Any) -> dict[str, str]:
@@ -260,6 +273,22 @@ class StageRuntime:
         if self._stage_init_executor is not None:
             self._stage_init_executor.shutdown(wait=True, cancel_futures=True)
             self._stage_init_executor = None
+
+        # [OmniDTPS Module 2] Release the cross-process DiT-load shared-memory
+        # segment. Only the writer (owns_segment=True) unlinks; AR subprocess
+        # readers only close their handles.
+        dit_shm = self._dit_load_shared_state
+        if dit_shm is not None:
+            self._dit_load_shared_state = None
+            try:
+                dit_shm.close()
+            except Exception:
+                logger.debug("[StageRuntime] shared memory close failed", exc_info=True)
+            if dit_shm.owns_segment:
+                try:
+                    dit_shm.unlink()
+                except Exception:
+                    logger.debug("[StageRuntime] shared memory unlink failed", exc_info=True)
 
     def create_membership_controller(self) -> Any | None:
         """Return a distributed membership controller, if this runtime needs one."""
@@ -553,6 +582,25 @@ class StageRuntime:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing executor_class")
             if plan.engine_args_dict is None:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing engine args")
+            # [OmniDTPS Module 2] Create the cross-process DiT-load segment ONCE
+            # (all AR replicas of a stage share the same stage_vllm_config /
+            # omni_dtps_config) and inject its NAME before launch_stage_replica
+            # spawns the subprocess, so the name crosses the pickle boundary and
+            # the AR scheduler can attach at construction. Only this LLM-launch
+            # path runs for AR stages, so no stage-type guard is needed.
+            dtps_cfg = getattr(vllm_config.model_config, "omni_dtps_config", None)
+            if isinstance(dtps_cfg, dict) and (dtps_cfg.get("dit_load_threshold", 0) or 0) > 0:
+                if self._dit_load_shared_state is None:
+                    try:
+                        self._dit_load_shared_state = DitLoadSharedState.create()
+                    except Exception:
+                        logger.debug(
+                            "[OmniDTPS] Failed to create DiT-load shared memory; "
+                            "Module 2 may not work across processes",
+                            exc_info=True,
+                        )
+                if self._dit_load_shared_state is not None:
+                    dtps_cfg[_DIT_LOAD_SHM_NAME_KEY] = self._dit_load_shared_state.name
             with self._scoped_spawn_device_env(physical_devices):
                 lock_fds = acquire_device_locks(
                     plan.metadata.stage_id,

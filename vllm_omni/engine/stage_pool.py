@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -1087,6 +1088,53 @@ class StagePool:
         if raw_client is None:
             return None
         return cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
+
+    async def poll_dit_load(
+        self, replica_id: int
+    ) -> tuple[int, int, list[str], list[str]] | None:
+        """Query one DiT replica's ``(waiting, running, waiting_ids, running_ids)``.
+
+        DTPS Module 2: the id lists let the AR scheduler de-duplicate its blind
+        in-flight set. Returns ``None`` on any failure (client detached, dead
+        engine, query timeout) so the orchestrator skips this replica's update
+        this tick. Diffusion-only: callers gate on
+        ``pool.stage_type == "diffusion"``.
+        """
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return None
+        try:
+            return await cast(StagePoolDiffusionClient, raw_client).get_dit_load_async()
+        except Exception:
+            logger.debug(
+                "[StagePool] poll_dit_load failed for stage-%s replica-%s",
+                self.stage_id, replica_id, exc_info=True,
+            )
+            return None
+
+    def check_dit_health(self, replica_id: int) -> bool:
+        """Return True iff the DiT replica's subprocess is alive.
+
+        Used by the orchestrator to evict a dead replica's load entry from
+        :class:`DitLoadState` immediately (instead of a stale-timeout filter).
+        Returns ``False`` when the client is detached or dead, ``True`` when
+        healthy. Diffusion-only: callers gate on
+        ``pool.stage_type == "diffusion"``.
+        """
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return False
+        try:
+            cast(StagePoolDiffusionClient, raw_client).check_health()
+            return True
+        except EngineDeadError:
+            return False
+        except Exception:
+            logger.debug(
+                "[StagePool] check_dit_health failed for stage-%s replica-%s",
+                self.stage_id, replica_id, exc_info=True,
+            )
+            return False
 
     # ---- Stage-local control plane ----
 

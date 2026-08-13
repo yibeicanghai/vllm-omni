@@ -58,6 +58,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
 
+        # [OmniDTPS] Optional DTPS component. Constructed only for AR+DiT
+        # deployments with an omni_dtps_config block (enabled: true); None
+        # otherwise, so schedule() stays pure FCFS.
+        self._dtps: Any = None
+        self._init_dtps_scheduler()
+
         # Track requests waiting for KV transfer (blocks not freed yet)
         self.waiting_for_transfer_free: set[str] = set()
 
@@ -111,6 +117,58 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             else:
                 return getattr(omni_kv_config, "kv_transfer_criteria", None)
         return None
+
+    def _init_dtps_scheduler(self) -> None:
+        """Construct the optional DTPS component for AR+DiT deployments.
+
+        Only built when ``merge_pipeline_deploy`` injected an
+        ``omni_dtps_config`` block with ``enabled: true`` (its own channel,
+        separate from ``omni_kv_config``). Every other deployment form gets no
+        such block, so this returns early and ``self._dtps`` stays ``None``
+        (pure FCFS). The Module 2 SHM name was injected into the block before
+        this subprocess was spawned, so ``DTPSScheduler.from_config`` attaches
+        the cross-process DiT-load segment at construction.
+        """
+        if not hasattr(self, "vllm_config"):
+            return
+        dtps_cfg = getattr(self.vllm_config.model_config, "omni_dtps_config", None)
+        if not dtps_cfg:
+            return
+        # Normalize a possible OmegaConf DictConfig to a plain dict via
+        # .items() (dict(DictConfig) iterates keys and would raise).
+        if isinstance(dtps_cfg, dict):
+            pass
+        elif hasattr(dtps_cfg, "items"):
+            dtps_cfg = dict(dtps_cfg.items())
+        else:
+            return
+        try:
+            from vllm_omni.core.sched.dtps_scheduler import DTPSScheduler
+
+            self._dtps = DTPSScheduler.from_config(dtps_cfg)
+            logger.info(
+                "[OmniDTPS] Module 1 active on AR stage %s: aging_threshold=%.1fs, "
+                "cot_tag_key=%r, cot_weight_entries=%d, max_tokens_divisor=%d "
+                "(<=0 disables the max_tokens ar_proxy term) | "
+                "Module 2 (DiT load awareness): dit_load_threshold=%d "
+                "(<=0 disables Module 2; idle when any replica waiting < threshold, "
+                "busy when all replicas waiting >= threshold)",
+                getattr(self.vllm_config.model_config, "stage_id", 0),
+                self._dtps.i2t_aging_s,
+                self._dtps.cot_tag_key,
+                len(self._dtps.cot_weight_table),
+                self._dtps.max_tokens_divisor,
+                self._dtps.dit_load_threshold,
+            )
+        except Exception:
+            # DTPS is a throughput optimization; never let its construction
+            # failure break the AR scheduler. Fall back to pure FCFS.
+            logger.exception(
+                "[OmniDTPS] Failed to construct DTPSScheduler; "
+                "falling back to FCFS on AR stage %s",
+                getattr(self.vllm_config.model_config, "stage_id", 0),
+            )
+            self._dtps = None
 
     def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
         """True when orchestrator will not run stage 1+ for this request (e.g. text-only).
@@ -221,6 +279,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
+
+        # [OmniDTPS] Reorder waiting by task-type priority before admission.
+        # Runs after process_pending_chunks (only schedulable WAITING remain)
+        # and before super().schedule() (admission order follows the reorder).
+        # No-op when self._dtps is None (non-AR+DiT or disabled).
+        if self._dtps is not None:
+            self._dtps.maybe_reorder_waiting(self.waiting, self.running)
 
         try:
             scheduler_output = super().schedule()
@@ -735,6 +800,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         try:
             # 2. Omni Specific: Check if we need to transfer KV
             if self._should_transfer_kv_for_request(request_id):
+                # [OmniDTPS Module 2] A downstream (t2i/it2i) request leaving
+                # AR's running set: register its id into the DTPS blind-spot
+                # set so AR counts it as in-flight DiT load until a poll reports
+                # it. No-op when DTPS is disabled; idempotent.
+                if self._dtps is not None:
+                    self._dtps.register_finished_downstream(request_id)
                 already_triggered = request_id in self.transfer_triggered_requests
                 is_active = request_id in self.active_kv_transfers
 

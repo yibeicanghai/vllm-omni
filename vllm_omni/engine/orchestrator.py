@@ -46,6 +46,8 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.core.sched.dit_load_shared import DitLoadSharedState
+from vllm_omni.core.sched.dit_load_state import DitLoadState
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -221,6 +223,8 @@ class Orchestrator:
         running_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
         log_stats: bool = False,
+        dit_load_state: DitLoadState | None = None,
+        dit_load_shared_state: DitLoadSharedState | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -252,6 +256,23 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+
+        # [OmniDTPS Module 2] Shared DiT-stage load state. The orchestrator
+        # writes per-replica (waiting, running) snapshots here every poll tick
+        # and evicts an entry when it detects the replica has exited. ``None``
+        # for deployments that don't use DTPS Module 2 — the load-poll is then
+        # skipped.
+        self._dit_load_state: DitLoadState | None = dit_load_state
+        # Cross-process shared-memory writer handle; the AR subprocess reads it
+        # by name. ``None`` when Module 2 is disabled (no segment created).
+        self._dit_load_shared_state: DitLoadSharedState | None = dit_load_shared_state
+        # Per-(stage_id, replica_id) last-poll timestamp, to throttle RPCs.
+        self._dit_load_last_poll: dict[tuple[int, int], float] = {}
+
+    # [OmniDTPS Module 2] Min interval between DiT-load polls per replica. The
+    # DiT queue depth changes at most once per denoise step, so polling faster
+    # just burns RPC round-trips.
+    _DIT_LOAD_POLL_INTERVAL_S: float = 0.1
 
     def _init_metrics_state(
         self,
@@ -405,6 +426,24 @@ class Orchestrator:
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
+                # [OmniDTPS Module 2] A remote DiT replica unregistered — evict
+                # its cached load entry so a stale waiting=0 can't pin the stage
+                # to idle. Best-effort: a missing addr→replica_id mapping means
+                # the entry was never polled.
+                if self._dit_load_state is not None and msg.stage_id < len(self.stage_pools):
+                    pool = self.stage_pools[msg.stage_id]
+                    if pool.stage_type == "diffusion":
+                        replica_id = pool.get_replica_id_by_addr(msg.input_addr)
+                        if replica_id is not None:
+                            try:
+                                self._dit_load_state.remove(msg.stage_id, replica_id)
+                            except Exception:
+                                logger.debug(
+                                    "[Orchestrator] DitLoadState.remove on unregister "
+                                    "failed for stage-%s rep-%s",
+                                    msg.stage_id, replica_id, exc_info=True,
+                                )
+                            self._refresh_dit_load_shared(self._dit_load_state)
             elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
@@ -637,6 +676,97 @@ class Orchestrator:
             logger.debug("[Orchestrator] _orchestration_output_handler cancelled")
             return
 
+    async def _poll_dit_load_throttled(
+        self,
+        stage_id: int,
+        pool: StagePool,
+        replica_id: int,
+        *,
+        force: bool = False,
+    ) -> None:
+        """[OmniDTPS Module 2] Sample one DiT replica's queue depth into shared state.
+
+        Throttled to ``_DIT_LOAD_POLL_INTERVAL_S`` per replica (unless ``force``
+        — used right after an output event, which is itself a load-change signal).
+        No-op when Module 2 isn't wired. A dead replica is evicted from
+        :class:`DitLoadState` before each poll so its last waiting=0 can't pin
+        the stage to idle. A ``None`` query result (transient timeout) skips
+        this tick.
+        """
+        state = self._dit_load_state
+        if state is None:
+            return
+        now = _time.monotonic()
+        key = (stage_id, replica_id)
+        if not force:
+            last = self._dit_load_last_poll.get(key, 0.0)
+            if (now - last) < self._DIT_LOAD_POLL_INTERVAL_S:
+                return
+        self._dit_load_last_poll[key] = now
+
+        # Exit-driven eviction: a dead replica's last waiting=0 would falsely
+        # signal idle, so drop it before polling.
+        if not pool.check_dit_health(replica_id):
+            try:
+                state.remove(stage_id, replica_id)
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] DitLoadState.remove failed for stage-%s rep-%s",
+                    stage_id, replica_id, exc_info=True,
+                )
+            self._refresh_dit_load_shared(state)
+            return
+
+        load = await pool.poll_dit_load(replica_id)
+        if load is None:
+            return
+        waiting, running, waiting_ids, running_ids = load
+        try:
+            state.update(
+                stage_id,
+                replica_id,
+                waiting,
+                running,
+                waiting_ids=waiting_ids,
+                running_ids=running_ids,
+            )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] DitLoadState.update failed for stage-%s rep-%s",
+                stage_id, replica_id, exc_info=True,
+            )
+            return
+
+        self._refresh_dit_load_shared(state)
+
+    def _refresh_dit_load_shared(self, state: DitLoadState) -> None:
+        """Write the current aggregate snapshot into the cross-process shared buffer."""
+        shm = self._dit_load_shared_state
+        if shm is None:
+            return
+        try:
+            shm.write(state.snapshot())
+        except Exception:
+            logger.debug(
+                "[Orchestrator] DitLoadSharedState.write failed",
+                exc_info=True,
+            )
+
+    async def _force_poll_dit_load(self, pool: StagePool) -> None:
+        """[OmniDTPS Module 2] Force-poll every live replica of a DiT stage.
+
+        Called right after a downstream dispatch so the just-enqueued work
+        reflects into SHM immediately (skipping the per-replica throttle). No-op
+        when Module 2 isn't wired. DiT replica counts are small and dispatches
+        run at most a few Hz, so the extra control-plane RPCs are cheap.
+        """
+        if self._dit_load_state is None:
+            return
+        for replica_id in pool.live_replica_ids():
+            await self._poll_dit_load_throttled(
+                pool.stage_id, pool, replica_id, force=True
+            )
+
     async def _orchestration_loop(self) -> None:
         """Poll stage pools and route logical outputs."""
         while not self._shutdown_event.is_set():
@@ -650,10 +780,21 @@ class Orchestrator:
                     if pool.stage_type == "diffusion":
                         output = pool.poll_diffusion_output(replica_id)
                         if output is None:
+                            # [OmniDTPS Module 2] No DiT output this tick, but
+                            # still sample this replica's queue depth so the AR
+                            # scheduler sees an up-to-date DiT load even while a
+                            # long denoise is in flight. Throttled per replica.
+                            await self._poll_dit_load_throttled(stage_id, pool, replica_id)
                             continue
 
                         pool.record_output_timestamps([output])
                         await self._handle_processed_outputs(stage_id, replica_id, [output])
+                        # A finished DiT output changes the queue depth, so
+                        # refresh this replica's load snapshot right away
+                        # (unthrottled — output events are at most a few Hz).
+                        await self._poll_dit_load_throttled(
+                            stage_id, pool, replica_id, force=True
+                        )
                         idle = False
                     else:
                         try:
@@ -1263,6 +1404,12 @@ class Orchestrator:
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             req_state.stage_submit_ts[next_logical] = _time.time()
+            # [OmniDTPS Module 2] A downstream dispatch inflates the DiT queue
+            # but the throttled load poll won't reflect it for up to
+            # _DIT_LOAD_POLL_INTERVAL_S, during which the AR scheduler would
+            # read a stale "idle" and over-dispatch. Force-poll the DiT
+            # replicas now (skipping the throttle) so SHM catches up.
+            await self._force_poll_dit_load(next_pool)
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
             self._emit_tx_edge(
                 from_stage=src_stage_id,
