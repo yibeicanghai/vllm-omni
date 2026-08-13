@@ -81,6 +81,7 @@ tick.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, NamedTuple
 
@@ -89,6 +90,8 @@ from vllm.logger import init_logger
 from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
+
+_OMNI_DEBUG_TAG = "[OmniDebug]"
 
 _DEFAULT_I2T_AGING_S = 5.0
 _DEFAULT_COT_TAG_KEY = "bot_task"
@@ -122,6 +125,15 @@ from vllm_omni.core.sched.dit_load_shared import (
 # i2t / t2t finish at the AR stage -> ar_only; t2i / it2i -> ar_downstream.
 _AR_ONLY_TASKS: frozenset[str] = frozenset({"i2t", "t2t"})
 _AR_DOWNSTREAM_TASKS: frozenset[str] = frozenset({"t2i", "it2i"})
+
+# Min seconds between DTPS reorder dumps (maybe_reorder_waiting runs every
+# schedule() tick). ~1Hz; 0 = every reorder, <0 = disabled.
+try:
+    _DTPS_DUMP_INTERVAL_S = float(
+        os.environ.get("VLLM_OMNI_DTPS_DUMP_INTERVAL_S", "1.0")
+    )
+except ValueError:
+    _DTPS_DUMP_INTERVAL_S = 1.0
 
 
 class DTPSScheduler:
@@ -455,6 +467,10 @@ class DTPSScheduler:
                     )
 
         inflight_blind = len(self._dit_inflight_ids)
+        if inflight_blind > 0:
+            logger.info(
+                f"{_OMNI_DEBUG_TAG}[dit_phase] _dit_inflight_ids={self._dit_inflight_ids}"
+            )
         inflight_total = inflight_running + inflight_blind
         if n_reps <= 1:
             inflight_reduced = inflight_total
@@ -477,6 +493,37 @@ class DTPSScheduler:
             "fresh_poll": fresh_poll,
         }
         return phase
+
+    def _dit_load_summary(self, inflight: int = 0) -> str:
+        """One-line DiT-load snapshot for the reorder dump (Module 2 only)."""
+        if self.dit_load_threshold <= 0:
+            return ""
+        infl = max(int(inflight or 0), 0)
+        load = self._dit_load
+        if load is None:
+            return f"dit=none +infl={infl}" if infl else "dit=none"
+        stats = self._last_phase_stats
+        if not stats:
+            suffix = f" +infl={infl}" if infl else ""
+            return f"dit=none{suffix}"
+        nrun = int(stats.get("inflight_running", 0))
+        mblind = int(stats.get("inflight_blind", 0))
+        total = int(stats.get("inflight_total", 0))
+        n_reps = int(stats.get("n_reps", 0))
+        nred = int(stats.get("inflight_reduced", 0))
+        rep_min = int(stats.get("reported_min", 0))
+        max_w = int(stats.get("max_waiting", 0))
+        tot_w = int(stats.get("total_waiting", 0))
+        tot_r = int(stats.get("total_running", 0))
+        eff = int(stats.get("effective_min", 0))
+        if n_reps <= 1:
+            fold = f"{total}//{n_reps}={nred}"
+        else:
+            fold = f"({nrun}+{mblind})={total}//{n_reps}={nred}"
+        return (
+            f"dit[min_w={rep_min},max_w={max_w},tot_w={tot_w},tot_r={tot_r},"
+            f"reps={n_reps}] infl[Nrun={nrun},Mblind={mblind},{fold},eff={eff}]"
+        )
 
     # ------------------------------------------------------------------ #
     #  Module 1: reorder self.waiting
@@ -537,34 +584,56 @@ class DTPSScheduler:
             budget_raw = max(0, self.dit_load_threshold - eff_min) * n_reps
 
         ar_only_reqs: list = []
-        downstream_reqs: list[tuple[int, Any]] = []
+        downstream_reqs: list[tuple[int, Any, dict[str, Any]]] = []
         starving_ar_only: list = []
         aging_threshold = self.i2t_aging_s
         now = time.time()
+        records: list[dict[str, Any]] = []
 
         for req in list(waiting):
             task = self._classify_task(req)
             bucket = self._task_bucket(task)
             arrival = getattr(req, "arrival_time", None)
             wait = (now - arrival) if arrival is not None else 0.0
+            rec: dict[str, Any] = {
+                "req": req,
+                "rid": getattr(req, "request_id", "?"),
+                "task": task,
+                "bucket": bucket,
+                "arrival": arrival,
+                "wait": wait,
+            }
             if bucket == "ar_only":
                 starving = wait > aging_threshold
+                rec["starving"] = starving
                 if starving:
                     starving_ar_only.append(req)
+                    rec["layer"] = "L0"
                 else:
                     ar_only_reqs.append(req)
+                    rec["layer"] = "L2"
             else:
-                proxy, _parts = self._ar_proxy_parts(req)
-                downstream_reqs.append((proxy, req))
+                proxy, parts = self._ar_proxy_parts(req)
+                rec["ar_proxy"] = proxy
+                rec["ar_proxy_parts"] = parts
+                downstream_reqs.append((proxy, req, rec))
+                rec["layer"] = "L1/L3"
+            records.append(rec)
 
         downstream_reqs.sort(key=lambda t: t[0])
 
         if budget_raw is None:
             downstream_head = [t[1] for t in downstream_reqs]
             downstream_tail: list = []
+            for _proxy, _req, rec in downstream_reqs:
+                rec["layer"] = "L1"
         else:
             downstream_head = [t[1] for t in downstream_reqs[:budget_raw]]
             downstream_tail = [t[1] for t in downstream_reqs[budget_raw:]]
+            for _proxy, _req, rec in downstream_reqs[:budget_raw]:
+                rec["layer"] = "L1"
+            for _proxy, _req, rec in downstream_reqs[budget_raw:]:
+                rec["layer"] = "L3"
 
         ordered = starving_ar_only + downstream_head + ar_only_reqs + downstream_tail
         if hasattr(waiting, "clear") and hasattr(waiting, "extend"):
@@ -574,3 +643,130 @@ class DTPSScheduler:
             waiting.remove_requests(list(waiting))
             for req in ordered:
                 waiting.add_request(req)
+
+        self._dump_reorder(
+            records,
+            ordered,
+            phase=phase,
+            inflight=inflight_running,
+            budget_raw=budget_raw,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Debug dump (computation + result + basis)
+    # ------------------------------------------------------------------ #
+
+    def _dump_reorder(
+        self,
+        records: list[dict[str, Any]],
+        ordered: list,
+        *,
+        phase: str = "idle",
+        inflight: int = 0,
+        budget_raw: int | None = None,
+    ) -> None:
+        """Emit a throttled debug dump of one DTPS reorder.
+
+        Throttled by ``_DTPS_DUMP_INTERVAL_S`` (env ``VLLM_OMNI_DTPS_DUMP_INTERVAL_S``):
+        ~1 Hz by default, 0 = every reorder, <0 = disabled. For local
+        diagnosis only; remove before formal merge.
+        """
+        if _DTPS_DUMP_INTERVAL_S < 0:
+            return
+        now_mono = time.monotonic()
+        if _DTPS_DUMP_INTERVAL_S > 0 and (
+            now_mono - getattr(self, "_last_dtps_dump_ts", 0.0)
+            < _DTPS_DUMP_INTERVAL_S
+        ):
+            return
+        self._last_dtps_dump_ts = now_mono
+
+        if not records:
+            return
+
+        def _short(rid: Any) -> str:
+            rid = str(rid)
+            return rid if len(rid) <= 16 else rid[:16] + "…"
+
+        calc_lines = []
+        for rec in records:
+            parts = [f"id={_short(rec['rid'])}", f"task={rec['task']}",
+                     f"bucket={rec['bucket']}", f"layer={rec['layer']}"]
+            if rec["bucket"] == "ar_only":
+                parts.append(f"wait={rec['wait']:.2f}s")
+                parts.append(f"starving={'Y' if rec['starving'] else 'N'}"
+                             f"(thr={self.i2t_aging_s:.1f}s)")
+            else:
+                p = rec["ar_proxy_parts"]
+                parts.append(
+                    f"ar_proxy={rec['ar_proxy']}"
+                    f"(np={p['num_prompt']}+cot={p['cot_weight']}"
+                    f"<{p['cot_tag']}>+mt={p['max_tokens_term']}"
+                    f"<{p['max_tokens']}//{self.max_tokens_divisor}>)"
+                )
+                parts.append(f"wait={rec['wait']:.2f}s")
+            calc_lines.append("  " + " | ".join(parts))
+
+        order_ids = [_short(getattr(r, "request_id", "?")) for r in ordered]
+        before_ids = [_short(rec["rid"]) for rec in records]
+        changed = order_ids != before_ids
+
+        n_l0 = len([r for r in records if r["layer"] == "L0"])
+        n_l1 = len([r for r in records if r["layer"] == "L1"])
+        n_l2 = len([r for r in records if r["layer"] == "L2"])
+        n_l3 = len([r for r in records if r["layer"] == "L3"])
+        layer_summary = (
+            f"L0(starving i2t)={n_l0} "
+            f"L1(ds≤budget)={n_l1} "
+            f"L2(i2t)={n_l2} "
+            f"L3(ds>budget)={n_l3}"
+        )
+        dit_summary = self._dit_load_summary(inflight)
+        phase_str = f" phase={phase}"
+        dit_str = f" {dit_summary}" if dit_summary else ""
+        budget_str = (
+            " budget=none(Module2 off)"
+            if budget_raw is None else
+            f" budget={budget_raw}(L1 cap)"
+        )
+        # Three order-label states: busy (budget=0, L1 empty), idle with the
+        # budget binding (non-empty L3 tail), idle with headroom covering all
+        # downstream (L3 empty).
+        if phase == "busy":
+            order_label = "result (admission order, L0→L2→L3 [DiT busy: i2t before downstream])"
+        elif n_l3 > 0:
+            order_label = (f"result (admission order, L0→L1(cap={n_l1})→L2→L3 "
+                           f"[DiT idle, downstream capped at DiT budget])")
+        else:
+            order_label = "result (admission order, L0→L1→L2 [DiT idle, headroom covers all downstream])"
+        lines = [
+            f"{_OMNI_DEBUG_TAG} OmniDTPSReorder n={len(records)} {layer_summary}"
+            f"{phase_str}{dit_str}{budget_str} "
+            f"{'REORDERED' if changed else 'no-change'}",
+            "  compute (input order):",
+        ]
+        lines.extend(calc_lines)
+        lines.append(f"  {order_label}:")
+        lines.append("    " + " -> ".join(order_ids))
+        basis = (
+            "  basis: L0=starving ar_only(wait>i2t_aging_s) by arrival; "
+            "L1=ar_downstream within DiT budget by (ar_proxy,queue order) where "
+            "ar_proxy=num_prompt+cot_weight(tag)+max_tokens//divisor; "
+            "L2=rest ar_only by queue order(FCFS); "
+            "L3=ar_downstream beyond budget by (ar_proxy,queue order)"
+        )
+        if budget_raw is None:
+            basis += (
+                "; MODULE2 off: budget unbounded, L3 empty (pure Module 1 "
+                "L0<L1<L2, all downstream before i2t)"
+            )
+        else:
+            basis += (
+                f"; MODULE2 budget=max(0,thr-effective_min)*max(1,n_reps)="
+                f"{budget_raw}: only this many downstream (by ar_proxy) admitted "
+                "before i2t (L1); the rest demoted to L3 (after i2t) so post-admit "
+                "DiT load stays ≤ threshold. busy ⟹ budget=0 ⟹ L1 empty ⟹ "
+                "L0<L2<L3 (i2t first, don't pile onto a congested DiT queue)"
+            )
+        lines.append(basis)
+        logger.info("\n".join(lines))
