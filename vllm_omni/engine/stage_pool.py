@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
@@ -34,6 +35,9 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
+
+# Unified debug-log tag; all Omni debug logs are prefixed with [OmniDebug].
+_OMNI_DEBUG_TAG = "[OmniDebug]"
 
 
 @dataclass
@@ -900,6 +904,78 @@ class StagePool:
 
     # ---- Stage-local admission ----
 
+    @staticmethod
+    def _omni_task_label(req_state: "OrchestratorRequestState") -> str:
+        """Infer task type from req_state.final_stage_id: 0=i2t, >0=t2i/it2i."""
+        final_stage = getattr(req_state, "final_stage_id", -1)
+        if final_stage == 0:
+            return "i2t"
+        if final_stage > 0:
+            return "t2i/it2i"
+        return "unknown"
+
+    def _log_stage_recv(
+        self,
+        request_id: str,
+        req_state: "OrchestratorRequestState",
+        request: Any,
+        prompt_text: Any,
+        affinity_request_id: str | None,
+        submit_kwargs: dict[str, Any] | None,
+    ) -> None:
+        """Log one line when a stage receives a request, linking to the orchestrator dump."""
+        task = self._omni_task_label(req_state)
+        is_batch = isinstance(request, list)
+        n_prompts = len(request) if is_batch else 1
+        # Prompt brief: prefer prompt_text (AR has text), else inspect request.
+        if isinstance(prompt_text, str) and prompt_text:
+            prompt_brief = prompt_text[:60].replace("\n", " ")
+        elif is_batch:
+            prompt_brief = f"<batch:{n_prompts}>"
+        else:
+            # Diffusion single: request is OmniDiffusionRequest with a prompts field.
+            prompts = getattr(request, "prompts", None) if request is not None else None
+            if prompts and isinstance(prompts, (list, tuple)) and prompts:
+                p = prompts[0]
+                if isinstance(p, str) and p.strip():
+                    prompt_brief = p.strip().replace("\n", " ")[:60]
+                elif isinstance(p, dict):
+                    for key in ("prompt", "text", "content"):
+                        val = p.get(key)
+                        if isinstance(val, str) and val.strip():
+                            prompt_brief = val.strip().replace("\n", " ")[:60]
+                            break
+                    else:
+                        prompt_brief = ""
+                else:
+                    prompt_brief = f"<{type(p).__name__}>"
+            else:
+                prompt_brief = ""
+        # Wall-clock since the orchestrator received the request.
+        req_ts = getattr(req_state, "request_timestamp", 0.0)
+        now_wall = _time.time()
+        since_recv_ms = int((now_wall - req_ts) * 1000) if req_ts else -1
+        ts_iso = datetime.fromtimestamp(now_wall, tz=timezone.utc).isoformat()
+        now_mono = _time.monotonic()
+        # kv_sender_info in submit_kwargs marks a KV-transfer-bearing submit.
+        has_kv_send = "kv_sender_info" in (submit_kwargs or {})
+        logger.info(
+            "%s OmniStageRecv stage=%d type=%s recv requestId=%s task=%s "
+            "batch=%d prompt=%r since_recv=%dms kv_send=%s affinity=%s ts=%s mono=%.6f",
+            _OMNI_DEBUG_TAG,
+            self.stage_id,
+            self.stage_type,
+            request_id,
+            task,
+            n_prompts,
+            prompt_brief,
+            since_recv_ms,
+            has_kv_send,
+            affinity_request_id,
+            ts_iso,
+            now_mono,
+        )
+
     async def submit_initial(
         self,
         request_id: str,
@@ -912,6 +988,10 @@ class StagePool:
         params_override: Any = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
+        self._log_stage_recv(
+            request_id, req_state, request, prompt_text,
+            affinity_request_id, submit_kwargs,
+        )
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Convert plain vllm SamplingParams for single-stage diffusion models
         # that receive sampling params from the user/caller directly.
@@ -923,6 +1003,13 @@ class StagePool:
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
+            logger.info(
+                "[StagePool] Stage %d pick replica %d requestId %s stage type %s",
+                self.stage_id,
+                replica_id,
+                request_id,
+                self.stage_type,
+            )
             client = self._diffusion_client(replica_id)
             if isinstance(request, list):
                 await client.add_batch_request_async(request_id, request, params, **submit_kwargs)
@@ -933,6 +1020,13 @@ class StagePool:
         replica_id = await self._pick_or_select(
             request_id,
             affinity_request_id=affinity_request_id,
+        )
+        logger.info(
+            "[StagePool] Stage %d pick replica %d requestId %s stage type %s",
+            self.stage_id,
+            replica_id,
+            request_id,
+            self.stage_type,
         )
         client = self.clients[replica_id]
         if client is None:

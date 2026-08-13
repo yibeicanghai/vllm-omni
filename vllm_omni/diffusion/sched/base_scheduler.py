@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import fields
+from datetime import datetime, timezone
 
 from vllm.logger import init_logger
 
@@ -21,6 +23,9 @@ from vllm_omni.diffusion.sched.interface import (
 )
 
 logger = init_logger(__name__)
+
+# Unified debug-log tag, matching the [OmniDebug] prefix used by AR/Generation stages.
+_OMNI_DEBUG_TAG = "[OmniDebug]"
 
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
@@ -53,6 +58,8 @@ class _BaseScheduler(SchedulerInterface):
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
+        # Monotonic timestamp of a request's first DiT-stage scheduling.
+        self._dit_stage_start_times: dict[str, float] = {}
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
@@ -62,6 +69,7 @@ class _BaseScheduler(SchedulerInterface):
         self._running.clear()
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
+        self._dit_stage_start_times.clear()
         max_num_seqs = getattr(od_config, "max_num_seqs", 1)
         try:
             self.max_num_running_reqs = max(1, int(max_num_seqs))
@@ -81,9 +89,12 @@ class _BaseScheduler(SchedulerInterface):
         self._request_states[request_id] = state
         self._waiting.append(request_id)
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
+        logger.info(f"[_BaseScheduler] add_request request_id={request_id}")
         return request_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
+        # Diffusion-stage queue snapshot (unthrottled, every schedule tick).
+        self._dump_diffusion_queue_snapshot()
         scheduled_new_reqs: list[NewRequestData] = []
         scheduled_cached_request_ids: list[str] = []
 
@@ -109,6 +120,18 @@ class _BaseScheduler(SchedulerInterface):
                 self._running_sampling_params_key = state.sampling_params_key
             state.status = DiffusionRequestStatus.RUNNING
             self._running.append(request_id)
+            # Log a request's first DiT-stage scheduling (WAITING→RUNNING).
+            if request_id not in self._dit_stage_start_times:
+                now_mono = time.monotonic()
+                now_wall = time.time()
+                self._dit_stage_start_times[request_id] = now_mono
+                ts_iso = datetime.fromtimestamp(now_wall, tz=timezone.utc).isoformat()
+                pbrief = self._omni_diffusion_prompt_brief(state.req) if state.req else ""
+                logger.info(
+                    "%s OmniStageStart stage=DiT(%s) requestId=%s ts=%s mono=%.6f %s",
+                    _OMNI_DEBUG_TAG, self.__class__.__name__, request_id,
+                    ts_iso, now_mono, pbrief,
+                )
             if was_new_request:
                 scheduled_new_reqs.append(NewRequestData.from_state(state))
             else:
@@ -147,6 +170,111 @@ class _BaseScheduler(SchedulerInterface):
 
     def has_requests(self) -> bool:
         return bool(self._waiting or self._running)
+
+    # ---- [Omni] diffusion prompt brief ----
+
+    @staticmethod
+    def _omni_diffusion_prompt_brief(req) -> str:
+        """First 60 chars of a diffusion request's prompt text, for task distinction."""
+        prompts = getattr(req, "prompts", None)
+        if not prompts:
+            return ""
+        for p in prompts[:3]:
+            if isinstance(p, str) and p.strip():
+                text = p.strip().replace("\n", " ")
+                return f"prompt={text[:60]}"
+            if isinstance(p, dict):
+                for key in ("prompt", "text", "content"):
+                    val = p.get(key)
+                    if isinstance(val, str) and val.strip():
+                        text = val.strip().replace("\n", " ")
+                        return f"prompt={text[:60]}"
+        return f"prompt=<{type(prompts[0]).__name__}>"
+
+    # ---- [Omni] diffusion internal queue dump ----
+
+    def _dump_diffusion_queue_snapshot(self) -> None:
+        """Dump the diffusion queue snapshot each ``schedule()`` tick (unthrottled).
+
+        Prints waiting / running / finished with a per-request brief:
+        requestId | status | finished | step progress | resolution | kv_send |
+        prompt brief.
+        """
+        now_wall = time.time()
+        progress = getattr(self, "_request_progress", None) or {}
+
+        def _prompt_brief(req) -> str:
+            prompts = getattr(req, "prompts", None)
+            if not prompts:
+                return ""
+            # prompts is list[OmniPromptType]; take the first non-empty text.
+            for p in prompts[:3]:
+                if isinstance(p, str) and p.strip():
+                    text = p.strip().replace("\n", " ")
+                    return f"prompt={text[:60]}"
+                if isinstance(p, dict):
+                    # dict-shaped prompt; read the prompt/text field.
+                    for key in ("prompt", "text", "content"):
+                        val = p.get(key)
+                        if isinstance(val, str) and val.strip():
+                            text = val.strip().replace("\n", " ")
+                            return f"prompt={text[:60]}"
+            return f"prompt=<{type(prompts[0]).__name__}>"
+
+        def _state_brief(req_id: str) -> str:
+            state = self._request_states.get(req_id)
+            if state is None:
+                return f"reqId={req_id}|<no-state>"
+            status_name = state.status.name if state.status is not None else "?"
+            is_fin = state.is_finished()
+            fin_flag = "FINISHED" if is_fin else "active"
+            # denoise progress (StepScheduler only).
+            prog = progress.get(req_id)
+            step_str = f"step={prog.current_step}/{prog.total_steps}" if prog else "step=-"
+            # resolution from sampling_params_key.
+            hw = ""
+            res = ""
+            key = state.sampling_params_key
+            if key is not None:
+                if getattr(key, "height", None) and getattr(key, "width", None):
+                    hw = f"hw={int(key.height)}x{int(key.width)}"
+                if getattr(key, "resolution", None) is not None:
+                    res = f"res={key.resolution}"
+            # AR→DiT KV source.
+            kv_send = bool(getattr(state.req, "kv_sender_info", None))
+            pbrief = _prompt_brief(state.req) if state.req else ""
+            parts = [
+                f"reqId={req_id}",
+                f"status={status_name}",
+                f"finished={fin_flag}",
+                step_str,
+            ]
+            if hw:
+                parts.append(hw)
+            if res:
+                parts.append(res)
+            parts.append(f"kv_send={kv_send}")
+            if pbrief:
+                parts.append(pbrief)
+            return "|".join(parts)
+
+        waiting = list(self._waiting)
+        running = list(self._running)
+        finished = list(self._finished_req_ids)
+        cls_name = self.__class__.__name__
+
+        lines = [
+            f"{_OMNI_DEBUG_TAG} OmniQueueDump DiT({cls_name}) step={self._step_id} "
+            f"waiting={len(waiting)} running={len(running)} "
+            f"finished={len(finished)} max_running={self.max_num_running_reqs}"
+        ]
+        for rid in waiting:
+            lines.append(f"  WAIT  {_state_brief(rid)}")
+        for rid in running:
+            lines.append(f"  RUN   {_state_brief(rid)}")
+        for fid in finished:
+            lines.append(f"  DONE  reqId={fid}")
+        logger.info("\n".join(lines))
 
     def get_request_state(self, request_id: str) -> DiffusionRequestState | None:
         return self._request_states.get(request_id)
@@ -204,6 +332,22 @@ class _BaseScheduler(SchedulerInterface):
                 running_to_remove.add(request_id)
             if request_id in self._waiting:
                 waiting_to_remove.add(request_id)
+
+            # Request-completion log.
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            start_mono = self._dit_stage_start_times.pop(request_id, None)
+            if start_mono is not None:
+                dur_ms = int((now_mono - start_mono) * 1000)
+            else:
+                dur_ms = -1
+            ts_iso = datetime.fromtimestamp(now_wall, tz=timezone.utc).isoformat()
+            pbrief = self._omni_diffusion_prompt_brief(state.req) if state.req else ""
+            logger.info(
+                "%s OmniStageDone stage=DiT(%s) requestId=%s status=%s dur=%dms ts=%s mono=%.6f %s",
+                _OMNI_DEBUG_TAG, self.__class__.__name__, request_id,
+                status.name, dur_ms, ts_iso, now_mono, pbrief,
+            )
 
         if running_to_remove:
             self._running = [request_id for request_id in self._running if request_id not in running_to_remove]

@@ -802,6 +802,8 @@ class OrchestratorAggregator:
                 parts = [f"req={rid}"]
                 if e2e_evt:
                     parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
+                if "queue_wait_ms" in pt:
+                    parts.append(f"queue_wait={pt['queue_wait_ms']:.1f}ms")
                 if "preprocess_ms" in pt:
                     parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
                 if e2e_evt:

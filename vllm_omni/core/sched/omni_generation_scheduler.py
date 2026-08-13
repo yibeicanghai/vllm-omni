@@ -69,6 +69,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             token_budget = 0
         scheduled_timestamp = time.monotonic()
 
+        # Generation-stage queue snapshot (unthrottled). Only applies to
+        # LLM_GENERATION stages (e.g. TTS decoder). HunyuanImage-3.0's DiT is
+        # DIFFUSION and is dumped in _BaseScheduler.schedule() instead.
+        self._dump_queue_snapshot(
+            f"Gen(stage{getattr(self.vllm_config.model_config, 'stage_id', '?')})"
+        )
+
         self.kv_cache_manager.new_step_starts()
 
         scheduled_new_reqs: list[Request] = []
@@ -196,6 +203,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.running.append(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+            stage_label = f"Gen(stage{getattr(self.vllm_config.model_config, 'stage_id', '?')})"
+            self._log_stage_start(request.request_id, request, stage_label)
 
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
@@ -374,6 +383,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # ``async_chunk`` disabled this is a cheap O(n) no-op, kept
         # unconditional so the abort path stays uniform.
         self._realign_request_status_to_queues(request_ids)
+
+        # Log stage-done before super() removes the request from self.requests.
+        # Use _omni_stage_start_times (not is_finished()) to detect an unrecorded
+        # completion.
+        stage_label = f"Gen(stage{getattr(self.vllm_config.model_config, 'stage_id', '?')})"
+        if isinstance(request_ids, str):
+            _done_ids = (request_ids,)
+        elif request_ids is not None:
+            _done_ids = set(request_ids)
+        else:
+            _done_ids = set(self.requests.keys())
+        for _rid in _done_ids:
+            if _rid in self._omni_stage_start_times:
+                _req = self.requests.get(_rid)
+                if _req is not None:
+                    self._log_stage_done(_rid, _req, stage_label)
 
         finished = super().finish_requests(request_ids, finished_status)
 

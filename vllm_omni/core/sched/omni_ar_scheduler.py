@@ -220,6 +220,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ):
                 self.pending_stop_after_extraction.discard(request.request_id)
                 request.status = RequestStatus.FINISHED_STOPPED
+                self._log_stage_done(request.request_id, request, "AR(stage0)")
                 return True
             return False
 
@@ -264,6 +265,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
+        self._dump_queue_snapshot("AR(stage0)")
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
@@ -290,6 +292,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         try:
             scheduler_output = super().schedule()
         finally:
+            for nr in scheduler_output.scheduled_new_reqs:
+                req_id = getattr(nr, "req_id", None)
+                req = self.requests.get(req_id) if req_id else None
+                if req is not None:
+                    self._log_stage_start(req_id, req, "AR(stage0)")
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(
@@ -463,7 +470,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Check for stop and update request status.
             if new_token_ids:
+                had_output_before = len(getattr(request, "_output_token_ids", [])) > 0
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                if not had_output_before and new_token_ids:
+                    self._log_prefill_done(request.request_id, request, "AR(stage0)")
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -510,6 +520,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
+                    self._log_stage_done(request.request_id, request, "AR(stage0)")
                     kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -711,6 +722,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # ``OmniSchedulerMixin._realign_request_status_to_queues`` and
         # #3774 discussion.
         self._realign_request_status_to_queues(request_ids)
+
+        # Log stage-done before super() removes the request from self.requests.
+        # Use _omni_stage_start_times (not is_finished()) to detect an unrecorded
+        # completion: the KV-transfer path sets status directly in
+        # _process_kv_transfer_trigger, so is_finished() is already True there
+        # but _log_stage_done has not yet run.
+        if isinstance(request_ids, str):
+            _done_ids = (request_ids,)
+        elif request_ids is not None:
+            _done_ids = set(request_ids)
+        else:
+            _done_ids = set(self.requests.keys())
+        for _rid in _done_ids:
+            if _rid in self._omni_stage_start_times:
+                _req = self.requests.get(_rid)
+                if _req is not None:
+                    self._log_stage_done(_rid, _req, "AR(stage0)")
 
         finished = super().finish_requests(request_ids, finished_status)
 

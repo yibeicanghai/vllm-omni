@@ -44,7 +44,10 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import (
+    serialize_additional_information,
+    deserialize_additional_information,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.core.sched.dit_load_shared import DitLoadSharedState
 from vllm_omni.core.sched.dit_load_state import DitLoadState
@@ -404,9 +407,99 @@ class Orchestrator:
 
     # ---- Request handling ----
 
+    def _classify_omni_task(self, msg) -> str:
+        """Classify a StageSubmissionMessage: i2t / t2i / it2i / other."""
+        final_stage = getattr(msg, "final_stage_id", None)
+        if final_stage is None:
+            return "other"
+        if final_stage <= 0:
+            return "i2t"
+        # final_stage > 0: AR+DiT path; split t2i vs it2i.
+        prompt = getattr(msg, "prompt", None)
+        info = None
+        if prompt is not None:
+            # prompt may be dict-like (PromptType) or an EngineCoreRequest.
+            info = getattr(prompt, "additional_information", None)
+            if info is None and isinstance(prompt, dict):
+                info = prompt.get("additional_information")
+        if info is not None:
+            if not isinstance(info, dict):
+                try:
+                    info = deserialize_additional_information(info)
+                except Exception:
+                    info = {}
+            if isinstance(info, dict) and info.get("bot_task"):
+                return "it2i"
+        return "t2i"
+
+    def _omni_msg_brief(self, msg) -> str:
+        """One-line brief of a StageSubmissionMessage."""
+        rid = getattr(msg, "request_id", "?")
+        rid_short = rid
+        task = self._classify_omni_task(msg)
+        final_stage = getattr(msg, "final_stage_id", "?")
+        hw = ""
+        prompt = getattr(msg, "prompt", None)
+        info = getattr(prompt, "additional_information", None) if prompt is not None else None
+        if info is None and isinstance(prompt, dict):
+            info = prompt.get("additional_information")
+        if info is not None and not isinstance(info, dict):
+            try: info = deserialize_additional_information(info)
+            except Exception: info = {}
+        if isinstance(info, dict):
+            meta = info.get("meta") or {}
+            if isinstance(meta, dict):
+                h, w = meta.get("height"), meta.get("width")
+                if h and w:
+                    hw = f"{int(h)}x{int(w)}"
+        # enqueue_ts is a perf_counter clock; compare against _time.perf_counter().
+        enqueue_ts = getattr(msg, "enqueue_ts", 0.0)
+        wait_ms = int((_time.perf_counter() - enqueue_ts) * 1000) if enqueue_ts > 0 else -1
+        mtype = getattr(msg, "type", "?")
+        return f"{rid_short}|{mtype}|{task}|final_stage={final_stage}|wait={wait_ms}ms|{hw}"
+
+    def _dump_orchestrator_queue(self) -> None:
+        """Dump request_async_queue: total / by message type / by task type / per-msg."""
+        logger.info("[OmniDebug] dump orchestrator queue start")
+        async_q = self.request_async_queue
+        qsize = async_q.qsize()
+        # Read-only walk of the underlying deque (asyncio.Queue._queue).
+        try:
+            pending = list(async_q._parent._queue)  # noqa: SLF001
+            if not pending:
+                logger.info("[OmniDebug] orchestrator queue size = 0")
+                return
+        except Exception:
+            logger.info("WARNING: can not get queue info")
+            pending = []
+
+        type_counts: dict[str, int] = {}
+        task_counts: dict[str, int] = {}
+        briefs: list[str] = []
+        for m in pending:
+            mtype = getattr(m, "type", type(m).__name__)
+            type_counts[mtype] = type_counts.get(mtype, 0) + 1
+            if hasattr(m, "request_id"):
+                task = self._classify_omni_task(m)
+                task_counts[task] = task_counts.get(task, 0) + 1
+                briefs.append("  " + self._omni_msg_brief(m))
+            else:
+                briefs.append(f"  {type(m).__name__}|{mtype}")
+
+        type_str = " ".join(f"{k}={v}" for k, v in sorted(type_counts.items()))
+        task_str = " ".join(f"{k}={v}" for k, v in sorted(task_counts.items()))
+        lines = [
+            f"[OmniOrchQueue] pending={qsize} | by_type: {type_str} | by_task: {task_str}",
+            *briefs,
+        ]
+        logger.info("=" * 80)
+        logger.info("\n".join(lines))
+        logger.info("=" * 80)
+
     async def _request_handler(self) -> None:
         """Read messages from the main thread via request_async_queue."""
         while True:
+            self._dump_orchestrator_queue()
             msg = await self.request_async_queue.get()
             msg_type = msg.type
 

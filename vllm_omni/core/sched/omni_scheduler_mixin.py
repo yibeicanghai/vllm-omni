@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Iterable
+from datetime import datetime, timezone
 from typing import Any
 
 from vllm.logger import init_logger
@@ -11,10 +12,19 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
+from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
+# Unified debug prefix for all Omni diagnostic logs (grep-friendly). Sub-labels
+# (OmniQueueDump / OmniStageStart / OmniStageDone / OmniStageRecv) follow it.
+_OMNI_DEBUG_TAG = "[OmniDebug]"
+
 _STATS_INTERVAL_S = 1.0
+
+# Min seconds between queue-snapshot dumps (schedule() runs every DiT step /
+# AR token, so per-tick is too noisy). 0 = dump every schedule, <0 = disabled.
+_DUMP_INTERVAL_S = float(os.environ.get("VLLM_OMNI_QUEUE_DUMP_INTERVAL_S", "1.0"))
 
 # Upper bound on how long a request may sit in full-payload-input wait
 # (the state ``OmniSchedulingCoordinator`` records via ``_waiting_since``)
@@ -39,6 +49,16 @@ except ValueError:
 
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
+
+    # Per-request monotonic timestamps: stage-admit time and prefill-done time,
+    # used by the stage start/done debug logs to compute dwell durations.
+    _omni_stage_start_times: dict[str, float]
+    _omni_prefill_done_times: dict[str, float]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._omni_stage_start_times = {}
+        self._omni_prefill_done_times = {}
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
@@ -157,6 +177,221 @@ class OmniSchedulerMixin:
             return None
         self._last_stats_time = now
         return super().make_stats(*args, **kwargs)
+
+    # ------------------------------------------------------------------ #
+    #  Request stage start / done timing logs (debug)
+    # ------------------------------------------------------------------ #
+
+    def _omni_task_label_for_req(self, req) -> str:
+        """Infer the task type from ``additional_information``."""
+        info = getattr(req, "additional_information", None)
+        if info is not None and not isinstance(info, dict):
+            try:
+                info = deserialize_additional_information(info)
+            except Exception:
+                info = None
+        if isinstance(info, dict):
+            fsid = info.get("omni_final_stage_id")
+            if fsid == 0:
+                return "i2t"
+            if fsid is not None and fsid > 0:
+                bot = info.get("bot_task")
+                return f"it2i/{bot}" if bot else "t2i"
+        return "?"
+
+    def _omni_prompt_brief_for_req(self, req) -> str:
+        """A short prompt fingerprint to distinguish requests."""
+        ptids = getattr(req, "prompt_token_ids", None)
+        if ptids and isinstance(ptids, (list, tuple)):
+            head = ptids[:8]
+            return f"tokens_head={list(head)}"
+        return ""
+
+    def _log_stage_start(self, request_id: str, req: Any, stage_label: str) -> None:
+        """Log a request's first admission to a stage (WAITING -> RUNNING).
+
+        Idempotent: records the monotonic admit timestamp once per request,
+        consumed by :meth:`_log_stage_done` for dwell computation.
+        """
+        key = request_id
+        if key in self._omni_stage_start_times:
+            return
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        self._omni_stage_start_times[key] = now_mono
+        task = self._omni_task_label_for_req(req)
+        prompt = self._omni_prompt_brief_for_req(req)
+        arrival = getattr(req, "arrival_time", None)
+        wait_ms = int((now_wall - arrival) * 1000) if arrival else -1
+        ts_iso = datetime.fromtimestamp(now_wall, tz=timezone.utc).isoformat()
+        logger.info(
+            "%s OmniStageStart stage=%s requestId=%s task=%s wait=%dms ts=%s mono=%.6f %s",
+            _OMNI_DEBUG_TAG, stage_label, request_id, task, wait_ms,
+            ts_iso, now_mono, prompt,
+        )
+
+    def _log_prefill_done(self, request_id: str, request: Any, stage_label: str) -> None:
+        """Log the prefill->decode switch point (first decode token sampled).
+
+        Idempotent. ``prefill_ms`` = this instant minus the stage-admit time.
+        """
+        if request_id in self._omni_prefill_done_times:
+            return
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        self._omni_prefill_done_times[request_id] = now_mono
+        start_mono = self._omni_stage_start_times.get(request_id)
+        prefill_ms = int((now_mono - start_mono) * 1000) if start_mono is not None else -1
+        task = self._omni_task_label_for_req(request)
+        prompt = self._omni_prompt_brief_for_req(request)
+        ts_iso = datetime.fromtimestamp(now_wall, tz=timezone.utc).isoformat()
+        logger.info(
+            "%s OmniPrefillDone stage=%s requestId=%s task=%s prefill=%dms ts=%s mono=%.6f %s",
+            _OMNI_DEBUG_TAG, stage_label, request_id, task, prefill_ms,
+            ts_iso, now_mono, prompt,
+        )
+
+    def _log_stage_done(self, request_id: str, request: Any, stage_label: str) -> None:
+        """Log a request's completion at a stage, with dwell durations."""
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        start_mono = self._omni_stage_start_times.pop(request_id, None)
+        prefill_done_mono = self._omni_prefill_done_times.pop(request_id, None)
+        if start_mono is not None:
+            dur_ms = int((now_mono - start_mono) * 1000)
+        else:
+            dur_ms = -1
+        if prefill_done_mono is not None:
+            prefill_ms = int((prefill_done_mono - start_mono) * 1000) if start_mono is not None else -1
+            decode_ms = int((now_mono - prefill_done_mono) * 1000)
+        else:
+            prefill_ms = -1
+            decode_ms = 0
+        task = self._omni_task_label_for_req(request)
+        prompt = self._omni_prompt_brief_for_req(request)
+        status = getattr(request, "status", None)
+        arrival = getattr(request, "arrival_time", None)
+        e2e_ms = int((now_wall - arrival) * 1000) if arrival else -1
+        status_name = status.name if status is not None else "?"
+        ts_iso = datetime.fromtimestamp(now_wall, tz=timezone.utc).isoformat()
+        logger.info(
+            "%s OmniStageDone stage=%s requestId=%s task=%s status=%s dur=%dms e2e=%dms ts=%s mono=%.6f %s",
+            _OMNI_DEBUG_TAG, stage_label, request_id, task,
+            status_name, dur_ms, e2e_ms, ts_iso, now_mono, prompt,
+        )
+
+    def _dump_queue_snapshot(self, stage_label: str) -> None:
+        """Dump an internal queue snapshot once per :data:`_DUMP_INTERVAL_S`.
+
+        Prints waiting / running / finished with a per-request brief
+        (requestId | task | status | finished | wait_ms | prompt/computed |
+        out | prompt_fingerprint). AR additionally dumps the KV-transfer state
+        sets; generation (LLM_GENERATION) dumps ``_pending_finish_reqs``.
+        Only covers stages running the vLLM V1 scheduler (LLM_AR /
+        LLM_GENERATION); diffusion stages are dumped by
+        ``_BaseScheduler._dump_diffusion_queue_snapshot``.
+        """
+        if _DUMP_INTERVAL_S < 0:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_queue_dump_ts", 0.0) < _DUMP_INTERVAL_S:
+            return
+        self._last_queue_dump_ts = now
+
+        now_wall = time.time()
+
+        def _task_label(req) -> str:
+            info = getattr(req, "additional_information", None)
+            if info is not None and not isinstance(info, dict):
+                try:
+                    info = deserialize_additional_information(info)
+                except Exception:
+                    info = None
+            if isinstance(info, dict):
+                fsid = info.get("omni_final_stage_id")
+                if fsid == 0:
+                    return "i2t"
+                if fsid is not None and fsid > 0:
+                    bot = info.get("bot_task")
+                    return f"it2i/{bot}" if bot else "t2i"
+                fot = info.get("final_output_type")
+                if fot:
+                    return str(fot)
+            return "?"
+
+        def _prompt_fingerprint(req) -> str:
+            ptids = getattr(req, "prompt_token_ids", None)
+            if ptids and isinstance(ptids, (list, tuple)):
+                head = ptids[:8]
+                return f"prompt_head={list(head)}"
+            return ""
+
+        def _req_brief(req) -> str:
+            rid = getattr(req, "request_id", "?")
+            status = getattr(req, "status", None)
+            status_name = status.name if status is not None else "?"
+            is_fin = getattr(req, "is_finished", None)
+            fin_flag = "FINISHED" if (callable(is_fin) and is_fin()) else "active"
+            arrival = getattr(req, "arrival_time", None)
+            wait_ms = int((now_wall - arrival) * 1000) if arrival else -1
+            npt = getattr(req, "num_prompt_tokens", 0)
+            nct = getattr(req, "num_computed_tokens", 0)
+            out_n = len(getattr(req, "_output_token_ids", []) or [])
+            pfp = _prompt_fingerprint(req)
+            parts = [
+                f"reqId={rid}",
+                f"task={_task_label(req)}",
+                f"status={status_name}",
+                f"finished={fin_flag}",
+                f"wait={wait_ms}ms",
+                f"prompt={npt}/computed={nct}",
+                f"out={out_n}",
+            ]
+            if pfp:
+                parts.append(pfp)
+            return "|".join(parts)
+
+        waiting = [r for r in self.waiting] if self.waiting is not None else []
+        running = list(self.running) if self.running else []
+        finished = (
+            list(self.finished_req_ids) if getattr(self, "finished_req_ids", None) else []
+        )
+
+        lines = [
+            f"{_OMNI_DEBUG_TAG} OmniQueueDump {stage_label} waiting={len(waiting)} "
+            f"running={len(running)} finished={len(finished)}"
+        ]
+        for r in waiting:
+            lines.append(f"  WAIT  {_req_brief(r)}")
+        for r in running:
+            lines.append(f"  RUN   {_req_brief(r)}")
+        for fid in finished:
+            lines.append(f"  DONE  reqId={fid}")
+
+        # AR-only: KV-transfer state machine.
+        kv_sets = {
+            "need_xfer": getattr(self, "requests_needing_kv_transfer", None),
+            "active": getattr(self, "active_kv_transfers", None),
+            "wait_free": getattr(self, "waiting_for_transfer_free", None),
+            "pend_stop": getattr(self, "pending_stop_after_extraction", None),
+            "triggered": getattr(self, "transfer_triggered_requests", None),
+        }
+        if any(v for v in kv_sets.values()):
+            kv_summary = " ".join(f"{k}={len(v)}" for k, v in kv_sets.items() if v)
+            lines.append(f"  KV   {kv_summary}")
+            for label in ("active", "wait_free"):
+                s = kv_sets[label]
+                if s:
+                    ids = list(s)
+                    lines.append(f"  KV.{label} {ids}")
+
+        # Generation-only: _pending_finish_reqs.
+        pending = getattr(self, "_pending_finish_reqs", None)
+        if pending:
+            ids = [getattr(r, "request_id", "?") for r in pending]
+            lines.append(f"  PEND_FINISH ({len(pending)}) {ids}")
+
+        logger.info("\n".join(lines))
 
     def _realign_request_status_to_queues(
         self,
