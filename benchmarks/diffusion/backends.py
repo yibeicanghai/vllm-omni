@@ -30,8 +30,6 @@ class RequestFuncInput:
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
-    image_data_urls: list[str] | None = None
-    image_bytes: list[bytes] | None = None
 
 
 @dataclass
@@ -44,10 +42,6 @@ class RequestFuncOutput:
     stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
-    ttft: float = 0.0
-    itl: list[float] = field(default_factory=list)
-    output_tokens: int = 0
-    generated_text: str = ""
 
 
 def _guess_mime_type(path: str) -> str:
@@ -112,19 +106,15 @@ async def async_request_image_edits(
         form.add_field("bot_task", str(bot_task))
 
     assert input.image_paths is not None
-    cached_bytes = input.image_bytes
-    for idx, img_path in enumerate(input.image_paths):
-        if cached_bytes is not None and idx < len(cached_bytes):
-            image_bytes = cached_bytes[idx]
-        else:
-            if not os.path.exists(img_path):
-                output.error = f"Image file not found: {img_path}"
-                output.success = False
-                if pbar:
-                    pbar.update(1)
-                return output
-            with open(img_path, "rb") as img_f:
-                image_bytes = img_f.read()
+    for img_path in input.image_paths:
+        if not os.path.exists(img_path):
+            output.error = f"Image file not found: {img_path}"
+            output.success = False
+            if pbar:
+                pbar.update(1)
+            return output
+        with open(img_path, "rb") as img_f:
+            image_bytes = img_f.read()
         form.add_field(
             "image",
             image_bytes,

@@ -2,14 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Request I/O types and async request functions for the mixed-task benchmark.
 
-Reuses ``diffusion/backends.py`` (RequestFuncInput / RequestFuncOutput and the
-chat / image-edits senders) and adds:
+Reuses ``diffusion/backends.py`` for the base ``RequestFuncInput`` /
+``RequestFuncOutput`` shapes and small image-encoding helpers, but keeps all
+mixed-specific state and senders here so the diffusion benchmark stays
+unmodified:
 
 * ``MixedRequest`` — a ``RequestFuncInput`` subclass carrying the client-side
-  task label (``i2t`` / ``t2i`` / ``it2i``) and the sampled ``bot_task`` used
-  only for per-task / per-bot_task statistics. Neither field is sent to the
-  server; the server resolves the task type itself from ``modalities`` plus the
-  presence of a reference image (see ``serving_chat._resolve_omni_task_type``).
+  task label (``i2t`` / ``t2i`` / ``it2i``), the sampled ``bot_task``, and the
+  send-time image caches (``image_data_urls`` / ``image_bytes``). None of these
+  are sent to the server; the server resolves the task type itself from
+  ``modalities`` plus the presence of a reference image (see
+  ``serving_chat._resolve_omni_task_type``).
+* ``MixedRequestFuncOutput`` — a ``RequestFuncOutput`` subclass adding the
+  text-streaming metrics (``ttft`` / ``itl`` / ``output_tokens`` /
+  ``generated_text``) captured by the streaming senders; non-stream senders
+  leave them at their defaults.
 * ``async_request_mixed_chat`` — a thin wrapper over
   ``async_request_chat_completions`` that lifts ``modalities`` (and a few
   generation knobs) from ``extra_body`` into the JSON payload so the same
@@ -17,6 +24,8 @@ chat / image-edits senders) and adds:
   t2i/it2i (``modalities=["image"]``) traffic, and that parses stage metrics
   from both the image-output (``content`` is a list) and text-output
   (``content`` is a string) response shapes.
+* ``async_request_image_edits`` — a mixed /v1/images/edits (non-stream) sender
+  (the diffusion one is not imported) that reuses the shared form builder.
 """
 
 from __future__ import annotations
@@ -45,7 +54,6 @@ from backends import (  # noqa: E402  (import after sys.path tweak)
     RequestFuncOutput,
     _encode_image_as_data_url,
     _guess_mime_type,
-    async_request_image_edits,
 )
 
 # Top-level request fields the OpenAI chat endpoint understands and that the
@@ -65,6 +73,11 @@ class MixedRequest(RequestFuncInput):
     ``task_type`` and ``bot_task`` are benchmark-side bookkeeping only — they
     drive per-task / per-bot_task statistics and never enter the HTTP payload.
     The server classifies the request from ``modalities`` (+ reference image).
+
+    ``image_data_urls`` / ``image_bytes`` are send-time caches populated by
+    ``prepare_request_images`` (pre-read + pre-encode the input images once) so
+    the senders skip file I/O and base64 under concurrency. They live here on
+    the mixed subclass — the diffusion ``RequestFuncInput`` is left untouched.
     """
 
     task_type: str = ""
@@ -73,6 +86,27 @@ class MixedRequest(RequestFuncInput):
     # generated input image's "WxH" so the tally / JSON can show the realized
     # input-resolution distribution without re-reading the image file.
     input_image_size: str | None = None
+    # Send-time caches (never sent). Populated by prepare_request_images.
+    image_data_urls: list[str] | None = None
+    image_bytes: list[bytes] | None = None
+
+
+@dataclass
+class MixedRequestFuncOutput(RequestFuncOutput):
+    """Mixed-benchmark output — adds text-streaming metrics on top of the
+    diffusion ``RequestFuncOutput``.
+
+    ``ttft`` / ``itl`` / ``output_tokens`` / ``generated_text`` are only set by
+    the streaming senders (AR-text TTFT/ITL); non-stream senders leave the
+    defaults so the aggregate stats can read them uniformly (``o.ttft <= 0.0``
+    marks a request that produced no AR text). Kept on this subclass so the
+    diffusion ``RequestFuncOutput`` is left untouched.
+    """
+
+    ttft: float = 0.0
+    itl: list[float] = field(default_factory=list)
+    output_tokens: int = 0
+    generated_text: str = ""
 
 
 def prepare_request_images(req: MixedRequest) -> None:
@@ -204,14 +238,14 @@ async def async_request_mixed_chat(
     input: MixedRequest,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
-) -> RequestFuncOutput:
+) -> MixedRequestFuncOutput:
     """POST /v1/chat/completions for any of i2t / t2i / it2i.
 
     Mirrors ``async_request_chat_completions`` but hoists ``modalities`` (and a
     few generation knobs) from ``extra_body`` to the payload root, and parses
     stage metrics for both image- and text-output response shapes.
     """
-    output = RequestFuncOutput()
+    output = MixedRequestFuncOutput()
     output.start_time = time.perf_counter()
 
     extra_body = dict(input.extra_body)
@@ -342,7 +376,7 @@ async def async_request_mixed_chat_stream(
     input: MixedRequest,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
-) -> RequestFuncOutput:
+) -> MixedRequestFuncOutput:
     """Streaming /v1/chat/completions that captures text-output TTFT / ITL.
 
     Adds ``stream: True`` (+ ``include_usage``) and parses the SSE stream the
@@ -362,7 +396,7 @@ async def async_request_mixed_chat_stream(
     ``response_body`` is reconstructed from the stream so the non-stream
     extraction / image-save logic in ``mixed_benchmark_serving`` works unchanged.
     """
-    output = RequestFuncOutput()
+    output = MixedRequestFuncOutput()
     output.start_time = time.perf_counter()
 
     try:
@@ -472,11 +506,21 @@ async def async_request_mixed_chat_stream(
     return output
 
 
-def _build_edits_form(input: MixedRequest, stream: bool) -> aiohttp.FormData:
+def _build_edits_form(
+    input: MixedRequest,
+    stream: bool,
+    *,
+    with_stage_metrics_flag: bool = True,
+) -> aiohttp.FormData:
     """Build the /v1/images/edits multipart form (shared by stream / non-stream).
 
     Raises FileNotFoundError if a referenced image is missing so the caller can
     surface it as a per-request error without sending.
+
+    ``with_stage_metrics_flag`` gates the ``return_stage_metrics`` form field.
+    The streaming sender forwards it (the server emits per-stage timings on the
+    stream); the non-stream sender omits it to match the diffusion edits sender
+    it replaces (which never forwarded that flag).
     """
     extra_body = dict(input.extra_body)
     width = input.width or extra_body.get("width") or 1024
@@ -508,7 +552,7 @@ def _build_edits_form(input: MixedRequest, stream: bool) -> aiohttp.FormData:
         form.add_field("sys_type", str(extra_body["sys_type"]))
     if extra_body.get("system_prompt") is not None:
         form.add_field("system_prompt", str(extra_body["system_prompt"]))
-    if extra_body.get("return_stage_metrics"):
+    if with_stage_metrics_flag and extra_body.get("return_stage_metrics"):
         form.add_field("return_stage_metrics", "true")
 
     bot_task = input.bot_task or extra_body.get("bot_task") or input.default_bot_task
@@ -534,11 +578,59 @@ def _build_edits_form(input: MixedRequest, stream: bool) -> aiohttp.FormData:
     return form
 
 
+async def async_request_image_edits(
+    input: MixedRequest,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixedRequestFuncOutput:
+    """POST /v1/images/edits (multipart, non-streaming) for it2i.
+
+    Mixed-benchmark counterpart of the diffusion edits sender: builds the form
+    via ``_build_edits_form`` (which honors the ``input.image_bytes`` cache so
+    the send skips file I/O) and returns a ``MixedRequestFuncOutput`` so the
+    aggregate stats can read ``ttft`` / ``itl`` / ``output_tokens`` /
+    ``generated_text`` uniformly — non-stream leaves them at their defaults
+    (``ttft == 0.0`` marks "no AR text captured").
+    """
+    output = MixedRequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    try:
+        form = _build_edits_form(input, stream=False, with_stage_metrics_flag=False)
+    except FileNotFoundError as e:
+        output.error = f"Image file not found: {e}"
+        output.success = False
+        if pbar:
+            pbar.update(1)
+        return output
+
+    try:
+        async with session.post(input.api_url, data=form) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                output.response_body = resp_json
+                output.success = True
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+
+    output.latency = time.perf_counter() - output.start_time
+    if output.success and input.slo_ms is not None:
+        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 async def async_request_image_edits_stream(
     input: MixedRequest,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
-) -> RequestFuncOutput:
+) -> MixedRequestFuncOutput:
     """Streaming /v1/images/edits that captures AR-text TTFT / ITL for it2i.
 
     The multi-stage edits stream emits ``ImageEditARDeltaChunk`` (``type=
@@ -550,7 +642,7 @@ async def async_request_image_edits_stream(
     metrics are reconstructed into ``response_body`` so the existing edits output
     path (``extract_edits_outputs`` / image save) works unchanged.
     """
-    output = RequestFuncOutput()
+    output = MixedRequestFuncOutput()
     output.start_time = time.perf_counter()
 
     try:
@@ -700,6 +792,7 @@ async def _iter_sse_events(
 __all__ = [
     "IT2I_BOT_TASKS",
     "MixedRequest",
+    "MixedRequestFuncOutput",
     "DEFAULT_EDITS_BOT_TASK",
     "prepare_request_images",
     "async_request_mixed_chat",
